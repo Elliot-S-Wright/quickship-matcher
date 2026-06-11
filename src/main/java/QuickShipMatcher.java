@@ -42,6 +42,10 @@ public class QuickShipMatcher implements Callable<Integer> {
             description = "Folder containing BOM .xlsx files (part numbers in column A of first sheet)")
     Path bomsDir;
 
+    @Option(names = {"-o", "--out"}, defaultValue = "matches.csv",
+            description = "CSV file to write matches to (default: ${DEFAULT-VALUE})")
+    Path outFile;
+
     /** A matched row from a BOM file. */
     record Match(String partNumber, String description) {
     }
@@ -69,7 +73,12 @@ public class QuickShipMatcher implements Callable<Integer> {
 
         List<Path> bomFiles = new ArrayList<>();
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(bomsDir, "*.xlsx")) {
-            stream.forEach(bomFiles::add);
+            for (Path p : stream) {
+                // Skip "~$..." lock files Excel creates while a workbook is open.
+                if (!p.getFileName().toString().startsWith("~$")) {
+                    bomFiles.add(p);
+                }
+            }
         }
         if (bomFiles.isEmpty()) {
             throw new IllegalStateException("No .xlsx files found in " + bomsDir.toAbsolutePath());
@@ -78,14 +87,16 @@ public class QuickShipMatcher implements Callable<Integer> {
 
         int matchedFiles = 0;
         int failedFiles = 0;
+        List<String> csvLines = new ArrayList<>();
+        csvLines.add("file,part_number,description");
         for (Path bomFile : bomFiles) {
             try {
                 List<Match> matches = searchBomFile(bomFile, quickShipKeys);
                 if (!matches.isEmpty()) {
                     matchedFiles++;
                     for (Match match : matches) {
-                        System.out.println(bomFile.getFileName() + " | " + match.partNumber()
-                                + " | " + match.description());
+                        csvLines.add(toCsvRow(bomFile.getFileName().toString(),
+                                match.partNumber(), match.description()));
                     }
                 }
             } catch (Exception e) {
@@ -94,7 +105,8 @@ public class QuickShipMatcher implements Callable<Integer> {
             }
         }
 
-        System.out.println();
+        Files.write(outFile, csvLines);
+        System.out.println("Wrote " + (csvLines.size() - 1) + " matches to " + outFile.toAbsolutePath());
         System.out.println("Done. Searched " + bomFiles.size() + " files, found matches in "
                 + matchedFiles + ", failed to read " + failedFiles + ".");
         return failedFiles == 0 ? 0 : 2;
@@ -138,6 +150,26 @@ public class QuickShipMatcher implements Callable<Integer> {
             }
         }
         return matches;
+    }
+
+    /** Builds one CSV row, escaping fields per RFC 4180. */
+    static String toCsvRow(String... fields) {
+        StringBuilder row = new StringBuilder();
+        for (int i = 0; i < fields.length; i++) {
+            if (i > 0) {
+                row.append(',');
+            }
+            row.append(csvEscape(fields[i]));
+        }
+        return row.toString();
+    }
+
+    /** Quotes a field if it contains commas, quotes, or newlines; doubles embedded quotes. */
+    static String csvEscape(String field) {
+        if (field.contains(",") || field.contains("\"") || field.contains("\n") || field.contains("\r")) {
+            return '"' + field.replace("\"", "\"\"") + '"';
+        }
+        return field;
     }
 
     /** Removes the 9th and 10th characters so e.g. QC081277WLN matches QC081277**N. */

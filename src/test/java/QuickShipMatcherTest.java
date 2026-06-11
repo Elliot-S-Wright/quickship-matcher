@@ -51,6 +51,34 @@ class QuickShipMatcherTest {
     }
 
     @Nested
+    class CsvOutput {
+
+        @Test
+        void plainFieldsArePassedThrough() {
+            assertEquals("bom.xlsx,QC060682WLN,Simple description",
+                    QuickShipMatcher.toCsvRow("bom.xlsx", "QC060682WLN", "Simple description"));
+        }
+
+        @Test
+        void fieldsWithCommasAreQuoted() {
+            // Real descriptions contain commas, e.g. "Quick Ship Indoor Walk-In, 6' W x 6' L..."
+            assertEquals("bom.xlsx,QC060682WLN,\"Quick Ship Indoor Walk-In, 6' W x 6' L\"",
+                    QuickShipMatcher.toCsvRow("bom.xlsx", "QC060682WLN", "Quick Ship Indoor Walk-In, 6' W x 6' L"));
+        }
+
+        @Test
+        void embeddedQuotesAreDoubled() {
+            assertEquals("\"NSF Vinyl Floor Screed 72\"\"\"",
+                    QuickShipMatcher.csvEscape("NSF Vinyl Floor Screed 72\""));
+        }
+
+        @Test
+        void fieldsWithNewlinesAreQuoted() {
+            assertEquals("\"Part\nNumber\"", QuickShipMatcher.csvEscape("Part\nNumber"));
+        }
+    }
+
+    @Nested
     class ExcelReading {
 
         @TempDir
