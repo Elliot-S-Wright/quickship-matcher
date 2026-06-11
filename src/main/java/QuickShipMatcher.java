@@ -4,6 +4,9 @@ import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import picocli.CommandLine;
+import picocli.CommandLine.Command;
+import picocli.CommandLine.Option;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -14,24 +17,53 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.Callable;
 
 /**
- * Scans every .xlsx file in the BOMs folder and reports rows whose Part Number
+ * Scans every .xlsx file in a BOMs folder and reports rows whose Part Number
  * (first column of the first sheet) matches a quick ship model number from the
  * SK Quickship report (second column). The 9th and 10th characters of the model
  * numbers are ignored for the comparison (they are wildcards like "**" in the
- * quick ship list, or door-option codes like "WL" in the BOMs).
+ * quick ship list, or door-position/hinge codes like "WL" in the BOMs).
  */
-public class QuickShipMatcher {
+@Command(name = "quickship-matcher",
+        description = "Finds quick ship model numbers in BOM Excel files.",
+        mixinStandardHelpOptions = true,
+        version = "quickship-matcher 1.0")
+public class QuickShipMatcher implements Callable<Integer> {
 
     private static final DataFormatter FORMATTER = new DataFormatter();
 
-    public static void main(String[] args) throws IOException {
-        Path baseDir = Path.of(args.length > 0 ? args[0] : ".");
-        Path quickShipFile = baseDir.resolve("SK Quickship Missing Cost Report.xlsx");
-        Path bomsDir = baseDir.resolve("BOMs");
+    @Option(names = {"-q", "--quickship-file"}, required = true,
+            description = "The SK Quickship report (.xlsx) with model numbers in column B")
+    Path quickShipFile;
+
+    @Option(names = {"-b", "--boms-dir"}, required = true,
+            description = "Folder containing BOM .xlsx files (part numbers in column A of first sheet)")
+    Path bomsDir;
+
+    /** A matched row from a BOM file. */
+    record Match(String partNumber, String description) {
+    }
+
+    public static void main(String[] args) {
+        System.exit(new CommandLine(new QuickShipMatcher()).execute(args));
+    }
+
+    @Override
+    public Integer call() throws IOException {
+        if (!Files.isRegularFile(quickShipFile)) {
+            throw new IllegalArgumentException("Quickship file not found: " + quickShipFile.toAbsolutePath());
+        }
+        if (!Files.isDirectory(bomsDir)) {
+            throw new IllegalArgumentException("BOMs folder not found: " + bomsDir.toAbsolutePath());
+        }
 
         Set<String> quickShipKeys = loadQuickShipModels(quickShipFile);
+        if (quickShipKeys.isEmpty()) {
+            throw new IllegalStateException("No model numbers found in column B of "
+                    + quickShipFile.getFileName() + " - has the report layout changed?");
+        }
         System.out.println("Loaded " + quickShipKeys.size() + " quick ship model numbers.");
         System.out.println();
 
@@ -39,28 +71,44 @@ public class QuickShipMatcher {
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(bomsDir, "*.xlsx")) {
             stream.forEach(bomFiles::add);
         }
+        if (bomFiles.isEmpty()) {
+            throw new IllegalStateException("No .xlsx files found in " + bomsDir.toAbsolutePath());
+        }
         bomFiles.sort(null);
 
         int matchedFiles = 0;
+        int failedFiles = 0;
         for (Path bomFile : bomFiles) {
-            if (searchBomFile(bomFile, quickShipKeys)) {
-                matchedFiles++;
+            try {
+                List<Match> matches = searchBomFile(bomFile, quickShipKeys);
+                if (!matches.isEmpty()) {
+                    matchedFiles++;
+                    for (Match match : matches) {
+                        System.out.println(bomFile.getFileName() + " | " + match.partNumber()
+                                + " | " + match.description());
+                    }
+                }
+            } catch (Exception e) {
+                failedFiles++;
+                System.err.println("Failed to read " + bomFile.getFileName() + ": " + e.getMessage());
             }
         }
 
         System.out.println();
-        System.out.println("Done. Searched " + bomFiles.size() + " files, found matches in " + matchedFiles + ".");
+        System.out.println("Done. Searched " + bomFiles.size() + " files, found matches in "
+                + matchedFiles + ", failed to read " + failedFiles + ".");
+        return failedFiles == 0 ? 0 : 2;
     }
 
     /** Reads the second column of the quick ship report and returns the normalized model numbers. */
-    private static Set<String> loadQuickShipModels(Path file) throws IOException {
+    static Set<String> loadQuickShipModels(Path file) throws IOException {
         Set<String> keys = new HashSet<>();
         try (InputStream in = Files.newInputStream(file);
              Workbook workbook = new XSSFWorkbook(in)) {
             Sheet sheet = workbook.getSheetAt(0);
             for (Row row : sheet) {
                 String value = cellText(row, 1);
-                // Skip blanks and header rows; real model numbers start with "QC".
+                // Skip blanks and header rows; real model numbers start with "QC"/"QF".
                 if (value.isEmpty() || value.equalsIgnoreCase("QuickShip")) {
                     continue;
                 }
@@ -71,11 +119,11 @@ public class QuickShipMatcher {
     }
 
     /**
-     * Searches the first sheet of a BOM file for part numbers matching a quick ship
-     * model. Prints any matches and returns whether at least one was found.
+     * Searches the first sheet of a BOM file and returns the rows whose part number
+     * (column A) matches a quick ship model, with their descriptions (column B).
      */
-    private static boolean searchBomFile(Path file, Set<String> quickShipKeys) {
-        boolean found = false;
+    static List<Match> searchBomFile(Path file, Set<String> quickShipKeys) throws IOException {
+        List<Match> matches = new ArrayList<>();
         try (InputStream in = Files.newInputStream(file);
              Workbook workbook = new XSSFWorkbook(in)) {
             Sheet sheet = workbook.getSheetAt(0);
@@ -85,19 +133,15 @@ public class QuickShipMatcher {
                     continue;
                 }
                 if (quickShipKeys.contains(normalize(partNumber))) {
-                    String description = cellText(row, 1).trim();
-                    System.out.println(file.getFileName() + " | " + partNumber + " | " + description);
-                    found = true;
+                    matches.add(new Match(partNumber, cellText(row, 1)));
                 }
             }
-        } catch (Exception e) {
-            System.err.println("Failed to read " + file.getFileName() + ": " + e.getMessage());
         }
-        return found;
+        return matches;
     }
 
-    /** Removes the 9th and 10th characters so e.g. QC081277WLN matches QC060682**N. */
-    private static String normalize(String value) {
+    /** Removes the 9th and 10th characters so e.g. QC081277WLN matches QC081277**N. */
+    static String normalize(String value) {
         String v = value.trim().toUpperCase();
         if (v.length() >= 10) {
             v = v.substring(0, 8) + v.substring(10);
